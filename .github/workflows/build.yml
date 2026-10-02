@@ -12,11 +12,16 @@ on:
         description: Release version (must match desktop/package.json at the chosen refs)
         required: true
         default: 0.1.0
+      platforms:
+        description: Which platforms to build
+        type: choice
+        options: [both, linux, windows]
+        default: both
       linux_ref:
-        description: Source ref for the Linux build (blank = skip Linux)
+        description: Source ref for the Linux build
         default: main
       windows_ref:
-        description: Source ref for the Windows build (blank = skip Windows)
+        description: Source ref for the Windows build
         default: main
       publish:
         description: Upload the installers to release v<version>
@@ -32,7 +37,7 @@ concurrency:
 
 jobs:
   linux:
-    if: inputs.linux_ref != ''
+    if: inputs.platforms != 'windows'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -106,7 +111,7 @@ jobs:
           if-no-files-found: error
 
   windows:
-    if: inputs.windows_ref != ''
+    if: inputs.platforms != 'linux'
     runs-on: windows-latest
     timeout-minutes: 75
     defaults:
