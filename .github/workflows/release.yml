@@ -1,0 +1,412 @@
+name: Release desktop apps
+
+# Builds macOS, Windows and Linux from the PRIVATE source repo and publishes them here. Actions
+# are free on public repos, so this is where releases are made.
+#
+# Nightly: if the source's main has commits the latest release was not built from, the next
+# patch version is built, tested on every platform and published. A release is promoted to
+# "latest" (what opennetworth.ai's download links and the in-app update feed follow) only once
+# EVERY platform's files are on it, so a half-built release is never offered to anyone.
+#
+# The source is checked out read-only onto throwaway runners and never committed, uploaded or
+# printed; only finished installers leave. Only schedule and manual triggers exist — no pull
+# request ever runs this workflow, so its secrets are never exposed to outside contributions.
+on:
+  schedule:
+    - cron: '0 20 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (blank = next patch after the newest release)
+        default: ''
+      ref:
+        description: Source ref to build
+        default: main
+      macos:
+        description: cloud = build and sign macOS here; skip = the release already has macOS files
+        type: choice
+        options: [cloud, skip]
+        default: cloud
+      force:
+        description: Release even if the latest release was built from the same commit
+        type: boolean
+        default: false
+      publish:
+        description: Publish (off = build and test only)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: open-net-worth-ai/open-net-worth
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      sha: ${{ steps.plan.outputs.sha }}
+      version: ${{ steps.plan.outputs.version }}
+      macos: ${{ steps.plan.outputs.macos }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TOKEN: ${{ secrets.ONW_SOURCE_TOKEN }}
+          HAS_MAC_SECRETS: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ inputs.ref || 'main' }}
+          VERSION_IN: ${{ inputs.version }}
+          FORCE: ${{ inputs.force && 'true' || 'false' }}
+          MACOS_IN: ${{ inputs.macos || 'cloud' }}
+        run: |
+          set -euo pipefail
+          skip() { echo "::notice::Nothing to release: $1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          sha="$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/commits/$REF" --jq .sha)"
+          source_version="$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/contents/desktop/package.json?ref=$sha" --jq .content | base64 -d | jq -r .version)"
+          released_sha="$(gh release view --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null | grep -oE 'Source: [0-9a-f]{40}' | cut -c9- || true)"
+          newest="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' | sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' | sort -V | tail -1)"
+          echo "source $sha (desktop/package.json $source_version); latest release built from ${released_sha:-unknown}; newest tag ${newest:-none}"
+
+          if [ "$sha" = "$released_sha" ] && [ "$FORCE" != true ] && [ -z "$VERSION_IN" ]; then
+            skip "the latest release is already built from $sha"
+          fi
+          if [ "$MACOS_IN" = cloud ] && [ "$HAS_MAC_SECRETS" != true ]; then
+            [ "$EVENT" = schedule ] && skip "macOS signing secrets are not set (run set-release-secrets.sh)"
+            echo "::error::macos=cloud needs the APPLE_* secrets; set them or choose macos=skip"; exit 1
+          fi
+
+          if [ -n "$VERSION_IN" ]; then
+            version="$VERSION_IN"
+          else
+            next="$(echo "${newest:-0.0.0}" | awk -F. '{print $1"."$2"."$3+1}')"
+            version="$(printf '%s\n%s\n' "$next" "$source_version" | sort -V | tail -1)"
+          fi
+          echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::bad version $version"; exit 1; }
+          echo "::notice::Releasing $version from $sha (macOS: $MACOS_IN)"
+          { echo "skip=false"; echo "sha=$sha"; echo "version=$version"; echo "macos=$MACOS_IN"; } >> "$GITHUB_OUTPUT"
+
+  macos:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.macos == 'cloud'
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - name: Stamp version
+        working-directory: src
+        run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Desktop unit tests
+        working-directory: src
+        run: |
+          python3 -m pip install -q -r requirements.txt
+          export ONW_DESKTOP_PYTHON="$(command -v python3)"
+          cd desktop
+          npm ci --silent
+          npm run typecheck --silent
+          npm test --silent > test.log 2>&1 || { grep -A25 '^not ok' test.log | head -200; tail -12 test.log; exit 1; }
+          tail -8 test.log
+      - name: Install signing identity
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass="$(openssl rand -base64 24)"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/signing.p12" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security find-identity -v -p codesigning "$keychain" | grep -q "Developer ID Application"
+      - name: Build relocatable runtime
+        working-directory: src
+        run: python3 scripts/build_desktop_runtime.py >/dev/null
+      - name: Package, sign and notarize
+        working-directory: src/desktop
+        env:
+          ONW_DESKTOP_SIGN: '1'
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: npm run make --silent >/dev/null
+      - name: Verify Gatekeeper acceptance and smoke the signed app
+        working-directory: src/desktop
+        env:
+          ONW_DESKTOP_UPDATES: '0'
+        run: |
+          app="$(find out -maxdepth 3 -type d -path '*/Open Net Worth.app' | head -1)"
+          codesign --verify --deep --strict "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          node qa/packaged-smoke.mjs "$PWD/$app/Contents/MacOS/open-net-worth"
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          cp "$(find src/desktop/out/make -name '*.dmg' | head -1)" release/Open-Net-Worth-mac-arm64.dmg
+          cp "$(find src/desktop/out/make -name '*.zip' | head -1)" "release/Open-Net-Worth-darwin-arm64-${{ needs.plan.outputs.version }}.zip"
+          ls -la release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: release/
+          retention-days: 3
+          if-no-files-found: error
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+
+  linux:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - name: Stamp version
+        working-directory: src
+        run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends xvfb fakeroot dpkg libgtk-3-0t64 libnss3 libgbm1 libasound2t64 libxss1 libxtst6 libatspi2.0-0t64 libsecret-1-0 libnotify4 >/dev/null
+      - name: Desktop unit tests
+        working-directory: src/desktop
+        run: |
+          export ONW_DESKTOP_PYTHON="$(command -v python3)"
+          npm ci --silent
+          npm run typecheck --silent
+          npm test --silent > test.log 2>&1 || { grep -A25 '^not ok' test.log | head -200; tail -12 test.log; exit 1; }
+          tail -8 test.log
+      - name: Build relocatable runtime
+        working-directory: src
+        run: python3 scripts/build_desktop_runtime.py >/dev/null
+      - name: Package AppImage and .deb
+        working-directory: src/desktop
+        run: npm run make --silent >/dev/null
+      - name: Smoke the packaged AppImage
+        working-directory: src/desktop
+        run: xvfb-run -a node qa/packaged-smoke-linux.mjs "$(realpath "$(find out/make -name '*.AppImage' | head -1)")"
+      - name: Install the .deb and smoke it with its sandbox
+        working-directory: src/desktop
+        run: |
+          sudo apt-get install -y -qq "$(realpath "$(find out/make -name '*.deb' | head -1)")" >/dev/null
+          test "$(stat -c %a /usr/lib/open-net-worth/chrome-sandbox)" = 4755
+          xvfb-run -a node qa/packaged-smoke-linux.mjs /usr/lib/open-net-worth/open-net-worth
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          cp "$(find src/desktop/out/make -name '*.AppImage' | head -1)" release/Open-Net-Worth-linux-x86_64.AppImage
+          cp "$(find src/desktop/out/make -name '*.deb' | head -1)" release/Open-Net-Worth-linux-amd64.deb
+          cp src/scripts/install-desktop.sh release/install.sh
+          ls -la release
+      - name: Terminal installer installs the staged AppImage
+        run: |
+          mkdir -p "$RUNNER_TEMP/served" && cp release/* "$RUNNER_TEMP/served/"
+          (cd "$RUNNER_TEMP/served" && sha256sum -- * > SHA256SUMS)
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$RUNNER_TEMP/served" >/dev/null 2>&1 &
+          sleep 1
+          export HOME="$RUNNER_TEMP/installer-home" ONW_RELEASE_BASE_URL=http://127.0.0.1:8765
+          mkdir -p "$HOME"
+          sh release/install.sh
+          test -x "$HOME/.local/bin/open-net-worth"
+          sh release/install.sh --uninstall
+          test ! -e "$HOME/.local/bin/open-net-worth"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: release/
+          retention-days: 3
+          if-no-files-found: error
+
+  windows:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v6
+      - name: Stamp version
+        working-directory: src
+        run: python scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Desktop unit tests
+        working-directory: src
+        run: |
+          python -m pip install -q -r requirements.txt
+          export ONW_DESKTOP_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          cd desktop
+          npm ci --silent
+          npm run typecheck --silent
+          npm test --silent > test.log 2>&1 || { grep -A25 '^not ok' test.log | head -200; tail -12 test.log; exit 1; }
+          tail -8 test.log
+      - name: Installer script tests (Pester)
+        working-directory: src
+        shell: pwsh
+        run: Invoke-Pester -Path scripts/install.Tests.ps1 -CI
+      - name: Build relocatable runtime
+        working-directory: src
+        run: python scripts/build_desktop_runtime.py >/dev/null
+      - name: Package application and installer
+        working-directory: src/desktop
+        run: npm run make --silent >/dev/null
+      - name: Install with install.ps1 and smoke the installed app
+        working-directory: src
+        shell: pwsh
+        env:
+          ONW_DESKTOP_UPDATES: '0'
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'onw-setup'
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item (Get-ChildItem desktop/out/make -Recurse -Filter 'Open-Net-Worth-windows-x64-setup.exe').FullName $dir
+          $hash = (Get-FileHash (Join-Path $dir 'Open-Net-Worth-windows-x64-setup.exe') -Algorithm SHA256).Hash.ToLower()
+          "$hash  Open-Net-Worth-windows-x64-setup.exe" | Set-Content (Join-Path $dir 'SHA256SUMS')
+          ./scripts/install.ps1 -SourceDirectory $dir -AllowUnsigned
+          Start-Sleep -Seconds 10
+          Get-Process open-net-worth -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 5
+          # The top-level open-net-worth.exe is Squirrel's launcher stub; smoke the real app.
+          $exe = (Get-ChildItem "$env:LOCALAPPDATA\OpenNetWorth\app-*\open-net-worth.exe" | Select-Object -First 1).FullName
+          Write-Host "smoking $exe"
+          Push-Location desktop
+          node qa/packaged-smoke.mjs $exe
+          Pop-Location
+      - name: Stage release files
+        shell: pwsh
+        run: |
+          $make = (Get-ChildItem src/desktop/out/make/squirrel.windows -Directory | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item (Join-Path $make 'Open-Net-Worth-windows-x64-setup.exe') release
+          Copy-Item (Join-Path $make 'RELEASES') release
+          Copy-Item (Get-ChildItem $make -Filter *-full.nupkg).FullName release
+          Copy-Item src/scripts/install.ps1 release
+          Get-ChildItem release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release/
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, macos, linux, windows]
+    if: >-
+      !cancelled() && needs.plan.outputs.skip != 'true'
+      && (github.event_name == 'schedule' || inputs.publish)
+      && needs.linux.result == 'success' && needs.windows.result == 'success'
+      && (needs.macos.result == 'success' || needs.plan.outputs.macos == 'skip')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release/
+          merge-multiple: true
+      - name: Upload to v${{ needs.plan.outputs.version }} with one merged SHA256SUMS
+        run: |
+          set -euo pipefail
+          ls -la release
+          notes="Open Net Worth $VERSION desktop app. Download the installer for your computer from https://opennetworth.ai. Installed apps update themselves.
+
+          Source: $SHA"
+          work="$(mktemp -d)"
+          if gh release view "v$VERSION" --repo "$REPO" >/dev/null 2>&1; then
+            gh release download "v$VERSION" --repo "$REPO" --pattern SHA256SUMS --dir "$work" || : > "$work/SHA256SUMS"
+          else
+            : > "$work/SHA256SUMS"
+            gh release create "v$VERSION" --repo "$REPO" --title "Open Net Worth $VERSION" --notes "$notes" --latest=false
+          fi
+          for f in release/*; do
+            name="$(basename "$f")"
+            grep -v "  $name\$" "$work/SHA256SUMS" > "$work/next" || true
+            (cd release && sha256sum "$name") >> "$work/next"
+            mv "$work/next" "$work/SHA256SUMS"
+          done
+          cp "$work/SHA256SUMS" release/SHA256SUMS
+          cat release/SHA256SUMS
+          gh release upload "v$VERSION" release/* --repo "$REPO" --clobber
+          gh release edit "v$VERSION" --repo "$REPO" --notes "$notes"
+      - name: Promote to latest once every platform is on the release
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "v$VERSION" --repo "$REPO" --json assets --jq '.assets[].name')"
+          missing=""
+          for name in Open-Net-Worth-mac-arm64.dmg "Open-Net-Worth-darwin-arm64-$VERSION.zip" \
+                      Open-Net-Worth-windows-x64-setup.exe RELEASES install.ps1 \
+                      Open-Net-Worth-linux-x86_64.AppImage Open-Net-Worth-linux-amd64.deb install.sh SHA256SUMS; do
+            echo "$assets" | grep -qx "$name" || missing="$missing $name"
+          done
+          echo "$assets" | grep -q -- '-full\.nupkg$' || missing="$missing <windows .nupkg>"
+          [ -z "$missing" ] || { echo "::error::v$VERSION is missing:$missing — not promoting it to latest"; exit 1; }
+          # Every file the SHA256SUMS lists must hash to what is uploaded.
+          work="$(mktemp -d)" && cd "$work"
+          gh release download "v$VERSION" --repo "$REPO"
+          sha256sum -c SHA256SUMS
+          gh release edit "v$VERSION" --repo "$REPO" --latest
+          echo "::notice::v$VERSION is now the latest release"
+      - name: Update feed offers the new version
+        continue-on-error: true
+        run: |
+          sleep 60
+          for feed in darwin-arm64 win32-x64; do
+            body="$(curl -fsS "https://update.electronjs.org/open-net-worth-ai/open-net-worth-releases/$feed/0.0.1" || true)"
+            echo "$feed: $body"
+            echo "$body" | grep -q "$VERSION" || echo "::warning::$feed feed does not list $VERSION yet (its cache refreshes within minutes)"
+          done
