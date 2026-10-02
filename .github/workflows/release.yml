@@ -115,6 +115,9 @@ jobs:
       - name: Stamp version
         working-directory: src
         run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Build relocatable runtime
+        working-directory: src
+        run: python3 scripts/build_desktop_runtime.py >/dev/null
       - name: Desktop unit tests
         working-directory: src
         run: |
@@ -141,9 +144,6 @@ jobs:
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           rm -f "$RUNNER_TEMP/signing.p12"
           security find-identity -v -p codesigning "$keychain" | grep -q "Developer ID Application"
-      - name: Build relocatable runtime
-        working-directory: src
-        run: python3 scripts/build_desktop_runtime.py >/dev/null
       - name: Package, sign and notarize
         working-directory: src/desktop
         env:
@@ -201,6 +201,9 @@ jobs:
       - name: Stamp version
         working-directory: src
         run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Build relocatable runtime
+        working-directory: src
+        run: python3 scripts/build_desktop_runtime.py >/dev/null
       - name: Install system packages
         run: |
           sudo apt-get update -qq
@@ -213,9 +216,6 @@ jobs:
           npm run typecheck --silent
           npm test --silent > test.log 2>&1 || { grep -E -B2 -A30 '^ *not ok' test.log | head -300; tail -12 test.log; exit 1; }
           tail -8 test.log
-      - name: Build relocatable runtime
-        working-directory: src
-        run: python3 scripts/build_desktop_runtime.py >/dev/null
       - name: Package AppImage and .deb
         working-directory: src/desktop
         run: npm run make --silent >/dev/null
@@ -280,6 +280,9 @@ jobs:
       - name: Stamp version
         working-directory: src
         run: python scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Build relocatable runtime
+        working-directory: src
+        run: python scripts/build_desktop_runtime.py >/dev/null
       - name: Desktop unit tests
         working-directory: src
         run: |
@@ -294,9 +297,6 @@ jobs:
         working-directory: src
         shell: pwsh
         run: Invoke-Pester -Path scripts/install.Tests.ps1 -CI
-      - name: Build relocatable runtime
-        working-directory: src
-        run: python scripts/build_desktop_runtime.py >/dev/null
       - name: Package application and installer
         working-directory: src/desktop
         run: npm run make --silent >/dev/null
