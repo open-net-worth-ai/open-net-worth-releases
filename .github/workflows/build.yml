@@ -169,7 +169,10 @@ jobs:
           Start-Sleep -Seconds 10
           Get-Process open-net-worth -ErrorAction SilentlyContinue | Stop-Process -Force
           Start-Sleep -Seconds 5
-          $exe = (Get-ChildItem "$env:LOCALAPPDATA\OpenNetWorth" -Recurse -Filter open-net-worth.exe | Select-Object -First 1).FullName
+          # The top-level open-net-worth.exe is Squirrel's launcher stub (starts app-<version> and
+          # exits); smoke the real app binary.
+          $exe = (Get-ChildItem "$env:LOCALAPPDATA\OpenNetWorth\app-*\open-net-worth.exe" | Select-Object -First 1).FullName
+          Write-Host "smoking $exe"
           Push-Location desktop
           node qa/packaged-smoke.mjs $exe
           Pop-Location
