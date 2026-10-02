@@ -123,7 +123,7 @@ jobs:
           cd desktop
           npm ci --silent
           npm run typecheck --silent
-          npm test --silent > test.log 2>&1 || { grep -A25 '^not ok' test.log | head -200; tail -12 test.log; exit 1; }
+          npm test --silent > test.log 2>&1 || { grep -E -B2 -A30 '^ *not ok' test.log | head -300; tail -12 test.log; exit 1; }
           tail -8 test.log
       - name: Install signing identity
         env:
@@ -211,7 +211,7 @@ jobs:
           export ONW_DESKTOP_PYTHON="$(command -v python3)"
           npm ci --silent
           npm run typecheck --silent
-          npm test --silent > test.log 2>&1 || { grep -A25 '^not ok' test.log | head -200; tail -12 test.log; exit 1; }
+          npm test --silent > test.log 2>&1 || { grep -E -B2 -A30 '^ *not ok' test.log | head -300; tail -12 test.log; exit 1; }
           tail -8 test.log
       - name: Build relocatable runtime
         working-directory: src
@@ -288,7 +288,7 @@ jobs:
           cd desktop
           npm ci --silent
           npm run typecheck --silent
-          npm test --silent > test.log 2>&1 || { grep -A25 '^not ok' test.log | head -200; tail -12 test.log; exit 1; }
+          npm test --silent > test.log 2>&1 || { grep -E -B2 -A30 '^ *not ok' test.log | head -300; tail -12 test.log; exit 1; }
           tail -8 test.log
       - name: Installer script tests (Pester)
         working-directory: src
