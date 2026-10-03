@@ -273,6 +273,9 @@ jobs:
     if: needs.plan.outputs.skip != 'true'
     runs-on: windows-latest
     timeout-minutes: 75
+    env:
+      # Windows consoles default to cp1252: any non-ASCII print would crash a build script.
+      PYTHONUTF8: "1"
     defaults:
       run:
         shell: bash
