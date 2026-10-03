@@ -54,6 +54,7 @@ jobs:
       sha: ${{ steps.plan.outputs.sha }}
       version: ${{ steps.plan.outputs.version }}
       macos: ${{ steps.plan.outputs.macos }}
+      litellm_ref: ${{ steps.plan.outputs.litellm_ref }}
     steps:
       - id: plan
         env:
@@ -90,7 +91,10 @@ jobs:
           fi
           echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::bad version $version"; exit 1; }
           echo "::notice::Releasing $version from $sha (macOS: $MACOS_IN)"
-          { echo "skip=false"; echo "sha=$sha"; echo "version=$version"; echo "macos=$MACOS_IN"; } >> "$GITHUB_OUTPUT"
+          # One LiteLLM commit for every platform, so all builds ship identical model prices.
+          litellm_ref="$(gh api repos/BerriAI/litellm/commits/main --jq .sha)"
+          echo "model prices from LiteLLM $litellm_ref"
+          { echo "skip=false"; echo "sha=$sha"; echo "version=$version"; echo "macos=$MACOS_IN"; echo "litellm_ref=$litellm_ref"; } >> "$GITHUB_OUTPUT"
 
   macos:
     needs: plan
@@ -115,6 +119,11 @@ jobs:
       - name: Stamp version
         working-directory: src
         run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python3 scripts/refresh_model_prices.py
       - name: Build relocatable runtime
         working-directory: src
         run: python3 scripts/build_desktop_runtime.py >/dev/null
@@ -201,6 +210,11 @@ jobs:
       - name: Stamp version
         working-directory: src
         run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python3 scripts/refresh_model_prices.py
       - name: Build relocatable runtime
         working-directory: src
         run: python3 scripts/build_desktop_runtime.py >/dev/null
@@ -280,6 +294,11 @@ jobs:
       - name: Stamp version
         working-directory: src
         run: python scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python scripts/refresh_model_prices.py
       - name: Build relocatable runtime
         working-directory: src
         run: python scripts/build_desktop_runtime.py >/dev/null
