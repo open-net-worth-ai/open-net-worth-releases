@@ -393,7 +393,7 @@ jobs:
             gh release download "v$VERSION" --repo "$REPO" --pattern SHA256SUMS --dir "$work" || : > "$work/SHA256SUMS"
           else
             : > "$work/SHA256SUMS"
-            gh release create "v$VERSION" --repo "$REPO" --title "Open Net Worth $VERSION" --notes "$notes" --latest=false
+            gh release create "v$VERSION" --repo "$REPO" --title "Open Net Worth $VERSION Beta" --notes "$notes" --latest=false
           fi
           for f in release/*; do
             name="$(basename "$f")"
