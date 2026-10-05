@@ -17,6 +17,10 @@ on:
       version:
         description: Version the build reports, X.Y.Z
         default: 0.2.0
+      gates:
+        description: Run the test gates and security scan first (off = build straight away)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -88,7 +92,7 @@ jobs:
   gate-backend:
     name: gate - backend tests
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
+    if: needs.plan.outputs.skip != 'true' && inputs.gates
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -115,7 +119,7 @@ jobs:
   gate-frontend:
     name: gate - frontend tests
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
+    if: needs.plan.outputs.skip != 'true' && inputs.gates
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -141,7 +145,7 @@ jobs:
   security:
     name: gate - security scan
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
+    if: needs.plan.outputs.skip != 'true' && inputs.gates
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -209,7 +213,8 @@ jobs:
   image:
     name: agent image (amd64 + arm64)
     needs: [plan, gate-backend, gate-frontend, security]
-    if: needs.plan.outputs.skip != 'true'
+    # Skipped gates (gates: false) must not skip the build; a FAILED gate still stops it.
+    if: ${{ !cancelled() && needs.plan.outputs.skip != 'true' && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -547,6 +552,7 @@ jobs:
   draft:
     name: manifest and signatures (no release)
     needs: [plan, gate-backend, gate-frontend, security, wheel, image, macos, linux, windows]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
