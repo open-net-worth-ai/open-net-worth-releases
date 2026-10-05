@@ -1,0 +1,596 @@
+name: Candidate
+
+# A TEST build of any source ref, for the owner to try before it reaches main. It runs the same
+# gates and builds as release.yml, signs the same way, then STOPS: no GitHub release (a draft would
+# move the nightly's version numbering), no `latest`/version image tags. Outputs:
+#   - image  ghcr.io/open-net-worth-ai/open-net-worth:candidate-<source sha> (digest in the summary)
+#   - the run's `candidate` artifact: desktop apps, wheel, manifest.json, SHA256SUMS + signatures
+#
+#   gh workflow run candidate.yml -R open-net-worth-ai/open-net-worth-releases -f ref=<branch>
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source ref to build
+        default: build/private-cloud
+      version:
+        description: Version the build reports, X.Y.Z
+        default: 0.2.0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: open-net-worth-ai/open-net-worth
+  IMAGE: ghcr.io/open-net-worth-ai/open-net-worth
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      sha: ${{ steps.plan.outputs.sha }}
+      version: ${{ steps.plan.outputs.version }}
+      promote: ${{ steps.plan.outputs.promote }}
+      litellm_ref: ${{ steps.plan.outputs.litellm_ref }}
+    steps:
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TOKEN: ${{ secrets.ONW_SOURCE_TOKEN }}
+          MINISIGN_KEY: ${{ secrets.ONW_MINISIGN_SECRET_KEY }}
+          HAS_MAC_SECRETS: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ inputs.ref || 'main' }}
+          VERSION_IN: ${{ inputs.version }}
+          FORCE: 'true'
+          PROMOTE: manual
+        run: |
+          set -euo pipefail
+          skip() { echo "::notice::Nothing to release: $1"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          sha="$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/commits/$REF" --jq .sha)"
+          source_version="$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/contents/desktop/package.json?ref=$sha" --jq .content | base64 -d | jq -r .version)"
+          released_sha="$(gh release view --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null | grep -oE 'Source: [0-9a-f]{40}' | cut -c9- || true)"
+          newest="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName --jq '.[].tagName' | sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' | sort -V | tail -1)"
+          echo "source $sha (desktop/package.json $source_version); latest release built from ${released_sha:-unknown}; newest tag ${newest:-none}"
+
+          if [ "$sha" = "$released_sha" ] && [ "$FORCE" != true ] && [ -z "$VERSION_IN" ]; then
+            skip "the latest release is already built from $sha"
+          fi
+          if [ "$HAS_MAC_SECRETS" != true ]; then
+            [ "$EVENT" = schedule ] && skip "macOS signing secrets are not set (run set-release-secrets.sh)"
+            echo "::error::the APPLE_* signing secrets are not all set"; exit 1
+          fi
+          [ -n "$SOURCE_TOKEN" ] || { echo "::error::secret ONW_SOURCE_TOKEN is not set"; exit 1; }
+          [ -n "$MINISIGN_KEY" ] || { echo "::error::secret ONW_MINISIGN_SECRET_KEY is not set - the release cannot be signed (RELEASING.md, minisign key)"; exit 1; }
+
+          if [ -n "$VERSION_IN" ]; then
+            version="$VERSION_IN"
+          else
+            next="$(echo "${newest:-0.0.0}" | awk -F. '{print $1"."$2"."$3+1}')"
+            version="$(printf '%s\n%s\n' "$next" "$source_version" | sort -V | tail -1)"
+          fi
+          echo "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::bad version $version"; exit 1; }
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null | grep -qx false; then
+            echo "::error::v$version is already published; releases are immutable - pick a new version"; exit 1
+          fi
+          echo "::notice::Releasing $version from $sha (promotion: $PROMOTE)"
+          # One LiteLLM commit for every artifact, so all builds ship identical model prices.
+          litellm_ref="$(gh api repos/BerriAI/litellm/commits/main --jq .sha)"
+          echo "model prices from LiteLLM $litellm_ref"
+          { echo "skip=false"; echo "sha=$sha"; echo "version=$version"; echo "promote=$PROMOTE"; echo "litellm_ref=$litellm_ref"; } >> "$GITHUB_OUTPUT"
+
+  gate-backend:
+    name: gate - backend tests
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install backend deps
+        working-directory: src
+        run: python3 -m pip install -q -r requirements.txt -r requirements-dev.txt > "$RUNNER_TEMP/pip.log" 2>&1 || { tail -20 "$RUNNER_TEMP/pip.log"; exit 1; }
+      - name: pytest, failing only on tests outside tests/known_failures.txt
+        working-directory: src
+        run: |
+          python3 -m pytest -q -m "not integration" --tb=no -p no:cacheprovider --junitxml="$RUNNER_TEMP/junit.xml" > "$RUNNER_TEMP/pytest.log" 2>&1 || true
+          tail -1 "$RUNNER_TEMP/pytest.log"
+          python3 scripts/gate_baseline.py pytest "$RUNNER_TEMP/junit.xml" tests/known_failures.txt
+
+  gate-frontend:
+    name: gate - frontend tests
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: vitest, failing only on tests outside frontend/known_failures.txt
+        working-directory: src/frontend
+        run: |
+          npm ci --silent --no-audit --no-fund > /dev/null 2>&1
+          # Generated, gitignored inputs the tests import (design tokens, entity registry).
+          npm run prebuild > /dev/null 2>&1
+          npx vitest run --reporter=json --outputFile="$RUNNER_TEMP/vitest.json" > "$RUNNER_TEMP/vitest.log" 2>&1 || true
+          python3 ../scripts/gate_baseline.py vitest "$RUNNER_TEMP/vitest.json" known_failures.txt
+
+  security:
+    name: gate - security scan
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install -q pip-audit semgrep bandit > /dev/null 2>&1
+      - name: pip-audit, npm audit, semgrep, bandit
+        working-directory: src
+        run: scripts/security_scan.sh
+
+  wheel:
+    name: build wheel + sdist
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - name: Stamp version
+        working-directory: src
+        run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python3 scripts/refresh_model_prices.py
+      - name: Build frontend + docs site, bundle, uv build
+        working-directory: src
+        run: |
+          (cd frontend && npm ci --silent && npm run build) > "$RUNNER_TEMP/build.log" 2>&1 || { tail -30 "$RUNNER_TEMP/build.log"; exit 1; }
+          (cd docs-site && npm ci --silent && npm run build:embed) >> "$RUNNER_TEMP/build.log" 2>&1 || { tail -30 "$RUNNER_TEMP/build.log"; exit 1; }
+          python3 scripts/bundle_assets.py > /dev/null
+          uv build > /dev/null
+          ls dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: src/dist/
+          retention-days: 3
+          if-no-files-found: error
+
+  image:
+    name: agent image (amd64 + arm64)
+    needs: [plan, gate-backend, gate-frontend, security]
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - name: Stamp version
+        working-directory: src
+        run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python3 scripts/refresh_model_prices.py
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build the amd64 image and boot it
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: src
+          load: true
+          push: false
+          tags: onw-release-smoke:amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+      - name: The image reports the release version and its contracts
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          docker run -d --name onw -e AUTH_PASSWORD=ci -p 127.0.0.1:8080:8080 onw-release-smoke:amd64 > /dev/null
+          for _ in $(seq 1 90); do curl -fsS http://127.0.0.1:8080/api/health > health.json 2>/dev/null && break; sleep 1; done
+          cat health.json
+          python3 - <<'PY'
+          import json, os
+          body = json.load(open("health.json"))
+          assert body["version"] == os.environ["VERSION"], f"image reports {body['version']}"
+          assert body["contracts"] == {"gateway": 1, "move": 1}, body["contracts"]
+          PY
+          docker rm -f onw > /dev/null
+      - name: Push the multi-arch image
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: src
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:candidate-${{ needs.plan.outputs.sha }}
+          # Links the package to this PUBLIC repo, not the private source.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
+          cache-from: type=gha
+          provenance: false
+
+  macos:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - name: Stamp version
+        working-directory: src
+        run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python3 scripts/refresh_model_prices.py
+      - name: Build relocatable runtime
+        working-directory: src
+        run: python3 scripts/build_desktop_runtime.py >/dev/null
+      - name: Desktop unit tests
+        working-directory: src
+        run: |
+          python3 -m pip install -q -r requirements.txt
+          export ONW_DESKTOP_PYTHON="$(command -v python3)"
+          cd desktop
+          npm ci --silent
+          npm run typecheck --silent
+          npm test --silent > test.log 2>&1 || { grep -E -B2 -A30 '^ *not ok' test.log | head -300; tail -12 test.log; exit 1; }
+          tail -8 test.log
+      - name: Install signing identity
+        env:
+          CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass="$(openssl rand -base64 24)"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/signing.p12" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security find-identity -v -p codesigning "$keychain" | grep -q "Developer ID Application"
+      - name: Package, sign and notarize
+        working-directory: src/desktop
+        env:
+          ONW_DESKTOP_SIGN: '1'
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: npm run make --silent >/dev/null
+      - name: Verify Gatekeeper acceptance and smoke the signed app
+        working-directory: src/desktop
+        env:
+          ONW_DESKTOP_UPDATES: '0'
+        run: |
+          app="$(find out -maxdepth 3 -type d -path '*/Open Net Worth.app' | head -1)"
+          codesign --verify --deep --strict "$app"
+          spctl --assess --type execute --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          node qa/packaged-smoke.mjs "$PWD/$app/Contents/MacOS/open-net-worth"
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          cp "$(find src/desktop/out/make -name '*.dmg' | head -1)" release/Open-Net-Worth-mac-arm64.dmg
+          cp "$(find src/desktop/out/make -name '*.zip' | head -1)" "release/Open-Net-Worth-darwin-arm64-${{ needs.plan.outputs.version }}.zip"
+          ls -la release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-macos
+          path: release/
+          retention-days: 3
+          if-no-files-found: error
+      - name: Remove signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+
+  linux:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - name: Stamp version
+        working-directory: src
+        run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python3 scripts/refresh_model_prices.py
+      - name: Build relocatable runtime
+        working-directory: src
+        run: python3 scripts/build_desktop_runtime.py >/dev/null
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends xvfb fakeroot dpkg libgtk-3-0t64 libnss3 libgbm1 libasound2t64 libxss1 libxtst6 libatspi2.0-0t64 libsecret-1-0 libnotify4 >/dev/null
+      - name: Desktop unit tests
+        working-directory: src/desktop
+        run: |
+          export ONW_DESKTOP_PYTHON="$(command -v python3)"
+          npm ci --silent
+          npm run typecheck --silent
+          npm test --silent > test.log 2>&1 || { grep -E -B2 -A30 '^ *not ok' test.log | head -300; tail -12 test.log; exit 1; }
+          tail -8 test.log
+      - name: Package AppImage and .deb
+        working-directory: src/desktop
+        run: npm run make --silent >/dev/null
+      - name: Smoke the packaged AppImage
+        working-directory: src/desktop
+        run: xvfb-run -a node qa/packaged-smoke-linux.mjs "$(realpath "$(find out/make -name '*.AppImage' | head -1)")"
+      - name: Install the .deb and smoke it with its sandbox
+        working-directory: src/desktop
+        run: |
+          sudo apt-get install -y -qq "$(realpath "$(find out/make -name '*.deb' | head -1)")" >/dev/null
+          test "$(stat -c %a /usr/lib/open-net-worth/chrome-sandbox)" = 4755
+          xvfb-run -a node qa/packaged-smoke-linux.mjs /usr/lib/open-net-worth/open-net-worth
+      - name: Stage release files
+        run: |
+          mkdir -p release
+          cp "$(find src/desktop/out/make -name '*.AppImage' | head -1)" release/Open-Net-Worth-linux-x86_64.AppImage
+          cp "$(find src/desktop/out/make -name '*.deb' | head -1)" release/Open-Net-Worth-linux-amd64.deb
+          cp src/scripts/install-desktop.sh release/install.sh
+          ls -la release
+      - name: Terminal installer installs the staged AppImage
+        run: |
+          mkdir -p "$RUNNER_TEMP/served" && cp release/* "$RUNNER_TEMP/served/"
+          (cd "$RUNNER_TEMP/served" && sha256sum -- * > SHA256SUMS)
+          python3 -m http.server 8765 --bind 127.0.0.1 --directory "$RUNNER_TEMP/served" >/dev/null 2>&1 &
+          sleep 1
+          export HOME="$RUNNER_TEMP/installer-home" ONW_RELEASE_BASE_URL=http://127.0.0.1:8765
+          mkdir -p "$HOME"
+          sh release/install.sh
+          test -x "$HOME/.local/bin/open-net-worth"
+          sh release/install.sh --uninstall
+          test ! -e "$HOME/.local/bin/open-net-worth"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-linux
+          path: release/
+          retention-days: 3
+          if-no-files-found: error
+
+  windows:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      # Windows consoles default to cp1252: any non-ASCII print would crash a build script.
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - name: Stamp version
+        working-directory: src
+        run: python scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python scripts/refresh_model_prices.py
+      - name: Build relocatable runtime
+        working-directory: src
+        run: python scripts/build_desktop_runtime.py >/dev/null
+      - name: Desktop unit tests
+        working-directory: src
+        run: |
+          python -m pip install -q -r requirements.txt
+          export ONW_DESKTOP_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+          cd desktop
+          npm ci --silent
+          npm run typecheck --silent
+          npm test --silent > test.log 2>&1 || { grep -E -B2 -A30 '^ *not ok' test.log | head -300; tail -12 test.log; exit 1; }
+          tail -8 test.log
+      - name: Installer script tests (Pester)
+        working-directory: src
+        shell: pwsh
+        run: Invoke-Pester -Path scripts/install.Tests.ps1 -CI
+      - name: Package application and installer
+        working-directory: src/desktop
+        run: npm run make --silent >/dev/null
+      - name: Install with install.ps1 and smoke the installed app
+        working-directory: src
+        shell: pwsh
+        env:
+          ONW_DESKTOP_UPDATES: '0'
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'onw-setup'
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item (Get-ChildItem desktop/out/make -Recurse -Filter 'Open-Net-Worth-windows-x64-setup.exe').FullName $dir
+          $hash = (Get-FileHash (Join-Path $dir 'Open-Net-Worth-windows-x64-setup.exe') -Algorithm SHA256).Hash.ToLower()
+          "$hash  Open-Net-Worth-windows-x64-setup.exe" | Set-Content (Join-Path $dir 'SHA256SUMS')
+          ./scripts/install.ps1 -SourceDirectory $dir -AllowUnsigned
+          Start-Sleep -Seconds 10
+          Get-Process open-net-worth -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 5
+          # The top-level open-net-worth.exe is Squirrel's launcher stub; smoke the real app.
+          $exe = (Get-ChildItem "$env:LOCALAPPDATA\OpenNetWorth\app-*\open-net-worth.exe" | Select-Object -First 1).FullName
+          Write-Host "smoking $exe"
+          Push-Location desktop
+          node qa/packaged-smoke.mjs $exe
+          Pop-Location
+      - name: Stage release files
+        shell: pwsh
+        run: |
+          $make = (Get-ChildItem src/desktop/out/make/squirrel.windows -Directory | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item (Join-Path $make 'Open-Net-Worth-windows-x64-setup.exe') release
+          Copy-Item (Join-Path $make 'RELEASES') release
+          Copy-Item (Get-ChildItem $make -Filter *-full.nupkg).FullName release
+          Copy-Item src/scripts/install.ps1 release
+          Get-ChildItem release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-windows
+          path: release/
+          retention-days: 3
+          if-no-files-found: error
+
+  draft:
+    name: manifest and signatures (no release)
+    needs: [plan, gate-backend, gate-frontend, security, wheel, image, macos, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: release/
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+      - name: Stamp version
+        working-directory: src
+        run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Assemble, write manifest.json + SHA256SUMS, sign, no release
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+          ONW_MINISIGN_SECRET_KEY: ${{ secrets.ONW_MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          cp dist/*.whl dist/*.tar.gz release/
+          cp src/scripts/install.sh release/install-server.sh
+          cp src/docker-compose.yml release/docker-compose.yml
+          sudo apt-get install -y -qq --no-install-recommends minisign > /dev/null
+          python3 src/scripts/release_manifest.py generate --version "$VERSION" --commit "$SHA" --image-digest "$DIGEST" --assets release
+          src/scripts/release_sign.sh "$VERSION" release
+          ls -la release
+          echo "Image: $IMAGE:candidate-$SHA@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: candidate
+          path: release/
+          retention-days: 14
+
