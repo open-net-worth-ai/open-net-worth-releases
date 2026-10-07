@@ -11,6 +11,12 @@ name: Release desktop apps
 # The source is checked out read-only onto throwaway runners and never committed, uploaded or
 # printed; only finished installers leave. Only schedule and manual triggers exist — no pull
 # request ever runs this workflow, so its secrets are never exposed to outside contributions.
+#
+# Agents (Private Cloud) follow the same release: the `image` job pushes
+# ghcr.io/open-net-worth-ai/open-net-worth:<version>, and once the desktop release is published
+# the last publish step adds the wheel, the server files and a signed manifest.json naming the
+# image digest. The portal's hourly release watch rolls that to Stable. A failure there never
+# holds back the desktop release: the watch simply waits for the next release with a manifest.
 on:
   schedule:
     - cron: '0 20 * * *'
@@ -45,6 +51,7 @@ concurrency:
 
 env:
   SOURCE_REPO: open-net-worth-ai/open-net-worth
+  IMAGE: ghcr.io/open-net-worth-ai/open-net-worth
 
 jobs:
   plan:
@@ -360,8 +367,125 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+  wheel:
+    name: build wheel + sdist
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - name: Stamp version
+        working-directory: src
+        run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python3 scripts/refresh_model_prices.py
+      - name: Build frontend + docs site, bundle, uv build
+        working-directory: src
+        run: |
+          (cd frontend && npm ci --silent && npm run build) > "$RUNNER_TEMP/build.log" 2>&1 || { tail -30 "$RUNNER_TEMP/build.log"; exit 1; }
+          (cd docs-site && npm ci --silent && npm run build:embed) >> "$RUNNER_TEMP/build.log" 2>&1 || { tail -30 "$RUNNER_TEMP/build.log"; exit 1; }
+          python3 scripts/bundle_assets.py > /dev/null
+          uv build > /dev/null
+          ls dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist
+          path: src/dist/
+          retention-days: 3
+          if-no-files-found: error
+
+  image:
+    name: agent image (amd64 + arm64)
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - name: Stamp version
+        working-directory: src
+        run: python3 scripts/stamp_version.py "${{ needs.plan.outputs.version }}"
+      - name: Refresh model prices
+        working-directory: src
+        env:
+          ONW_LITELLM_REF: ${{ needs.plan.outputs.litellm_ref }}
+        run: python3 scripts/refresh_model_prices.py
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build the amd64 image and boot it
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: src
+          load: true
+          push: false
+          tags: onw-release-smoke:amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+      - name: The image reports the release version and its contracts
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          docker run -d --name onw -e AUTH_PASSWORD=ci -p 127.0.0.1:8080:8080 onw-release-smoke:amd64 > /dev/null
+          for _ in $(seq 1 90); do curl -fsS http://127.0.0.1:8080/api/health > health.json 2>/dev/null && break; sleep 1; done
+          cat health.json
+          python3 - <<'PY'
+          import json, os
+          body = json.load(open("health.json"))
+          assert body["version"] == os.environ["VERSION"], f"image reports {body['version']}"
+          assert body["contracts"] == {"gateway": 1, "move": 1}, body["contracts"]
+          PY
+          docker rm -f onw > /dev/null
+      - name: Push the multi-arch image
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: src
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ needs.plan.outputs.version }}
+          # Links the package to this PUBLIC repo, not the private source.
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.plan.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.plan.outputs.sha }}
+          cache-from: type=gha
+          provenance: false
+
   publish:
-    needs: [plan, macos, linux, windows]
+    needs: [plan, macos, linux, windows, wheel, image]
     if: >-
       !cancelled() && needs.plan.outputs.skip != 'true'
       && (github.event_name == 'schedule' || inputs.publish)
@@ -432,3 +556,41 @@ jobs:
             echo "$feed: $body"
             echo "$body" | grep -q "$VERSION" || echo "::warning::$feed feed does not list $VERSION yet (its cache refreshes within minutes)"
           done
+      - name: Agent release - source scripts
+        if: needs.wheel.result == 'success' && needs.image.result == 'success'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ secrets.ONW_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - name: Agent release - wheel + sdist
+        if: needs.wheel.result == 'success' && needs.image.result == 'success'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+      - name: Agent release - wheel, server files and a signed manifest naming the image
+        if: needs.wheel.result == 'success' && needs.image.result == 'success'
+        env:
+          DIGEST: ${{ needs.image.outputs.digest }}
+          ONW_MINISIGN_SECRET_KEY: ${{ secrets.ONW_MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          python3 src/scripts/stamp_version.py "$VERSION" > /dev/null
+          rel="$RUNNER_TEMP/agent-release"
+          gh release download "v$VERSION" --repo "$REPO" --dir "$rel"
+          rm -f "$rel/SHA256SUMS" "$rel"/*.minisig "$rel/manifest.json"
+          cp dist/*.whl dist/*.tar.gz "$rel/"
+          cp src/scripts/install.sh "$rel/install-server.sh"
+          cp src/docker-compose.yml "$rel/docker-compose.yml"
+          sudo apt-get install -y -qq --no-install-recommends minisign > /dev/null
+          python3 src/scripts/release_manifest.py generate --version "$VERSION" --commit "$SHA" --image-digest "$DIGEST" --assets "$rel"
+          src/scripts/release_sign.sh "$VERSION" "$rel"
+          python3 src/scripts/release_manifest.py check "$rel"
+          cd "$rel"
+          gh release upload "v$VERSION" --repo "$REPO" --clobber \
+            ./*.whl ./*.tar.gz install-server.sh docker-compose.yml \
+            manifest.json manifest.json.minisig SHA256SUMS SHA256SUMS.minisig
+          echo "::notice::agent image $IMAGE:$VERSION@$DIGEST; manifest.json signed and published"
