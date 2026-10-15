@@ -17,6 +17,10 @@ name: Release desktop apps
 # the last publish step adds the wheel, the server files and a signed manifest.json naming the
 # image digest. The portal's hourly release watch rolls that to Stable. A failure there never
 # holds back the desktop release: the watch simply waits for the next release with a manifest.
+#
+# With the repository variable PYPI_PUBLISH=true, the last job publishes the same wheel and sdist
+# to PyPI (trusted publisher: this workflow, environment `pypi`), so `uv tool install
+# open-net-worth` and `onw upgrade` get each release.
 on:
   schedule:
     - cron: '0 20 * * *'
@@ -594,3 +598,25 @@ jobs:
             ./*.whl ./*.tar.gz install-server.sh docker-compose.yml \
             manifest.json manifest.json.minisig SHA256SUMS SHA256SUMS.minisig
           echo "::notice::agent image $IMAGE:$VERSION@$DIGEST; manifest.json signed and published"
+
+  pypi:
+    name: publish to PyPI
+    needs: [plan, wheel, image, publish]
+    if: >-
+      !cancelled() && vars.PYPI_PUBLISH == 'true'
+      && needs.publish.result == 'success' && needs.wheel.result == 'success'
+      && needs.image.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/open-net-worth/${{ needs.plan.outputs.version }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          skip-existing: true
