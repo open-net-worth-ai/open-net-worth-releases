@@ -359,7 +359,7 @@ jobs:
           codesign --verify --deep --strict "$app"
           spctl --assess --type execute --verbose=2 "$app"
           xcrun stapler validate "$app"
-          node qa/packaged-smoke.mjs "$PWD/$app/Contents/MacOS/open-net-worth"
+          node qa/packaged-smoke.mjs "$PWD/$app/Contents/MacOS/Open Net Worth"
       - name: Stage release files
         run: |
           mkdir -p release
