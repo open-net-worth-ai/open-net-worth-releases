@@ -63,6 +63,7 @@ jobs:
     outputs:
       skip: ${{ steps.plan.outputs.skip }}
       sha: ${{ steps.plan.outputs.sha }}
+      prev_sha: ${{ steps.plan.outputs.prev_sha }}
       version: ${{ steps.plan.outputs.version }}
       macos: ${{ steps.plan.outputs.macos }}
       litellm_ref: ${{ steps.plan.outputs.litellm_ref }}
@@ -105,7 +106,7 @@ jobs:
           # One LiteLLM commit for every platform, so all builds ship identical model prices.
           litellm_ref="$(gh api repos/BerriAI/litellm/commits/main --jq .sha)"
           echo "model prices from LiteLLM $litellm_ref"
-          { echo "skip=false"; echo "sha=$sha"; echo "version=$version"; echo "macos=$MACOS_IN"; echo "litellm_ref=$litellm_ref"; } >> "$GITHUB_OUTPUT"
+          { echo "skip=false"; echo "sha=$sha"; echo "prev_sha=$released_sha"; echo "version=$version"; echo "macos=$MACOS_IN"; echo "litellm_ref=$litellm_ref"; } >> "$GITHUB_OUTPUT"
 
   macos:
     needs: plan
@@ -502,6 +503,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ needs.plan.outputs.version }}
       SHA: ${{ needs.plan.outputs.sha }}
+      PREV_SHA: ${{ needs.plan.outputs.prev_sha }}
+      SOURCE_TOKEN: ${{ secrets.ONW_SOURCE_TOKEN }}
       REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
@@ -513,9 +516,24 @@ jobs:
         run: |
           set -euo pipefail
           ls -la release
+          # What changed since the previous release: its commit subjects, grouped by the source's
+          # own scripts/release_notes.py. Best effort - a failure here never blocks the release.
+          changes=""
+          if [ -n "$PREV_SHA" ] && GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/contents/scripts/release_notes.py?ref=$SHA" --jq .content | base64 -d > "$RUNNER_TEMP/release_notes.py" \
+            && subjects="$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/compare/$PREV_SHA...$SHA" --jq '[.commits[].commit.message | split("\n")[0]] | reverse | .[]')"; then
+            changes="$(printf '%s\n' "$subjects" | python3 "$RUNNER_TEMP/release_notes.py" || true)"
+          else
+            echo "::warning::no change list for $VERSION (previous source ${PREV_SHA:-unknown})"
+          fi
+          [ -z "$changes" ] || changes="$changes
+
+          **Full changelog:** https://github.com/$SOURCE_REPO/compare/$PREV_SHA...$SHA
+
+          "
           notes="Open Net Worth $VERSION desktop app. Download the installer for your computer from https://opennetworth.ai. Installed apps update themselves.
 
-          Source: $SHA"
+          ${changes}Source: $SHA"
+          printf '%s\n' "$notes"
           work="$(mktemp -d)"
           if gh release view "v$VERSION" --repo "$REPO" >/dev/null 2>&1; then
             gh release download "v$VERSION" --repo "$REPO" --pattern SHA256SUMS --dir "$work" || : > "$work/SHA256SUMS"
