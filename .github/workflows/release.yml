@@ -506,22 +506,31 @@ jobs:
       PREV_SHA: ${{ needs.plan.outputs.prev_sha }}
       SOURCE_TOKEN: ${{ secrets.ONW_SOURCE_TOKEN }}
       REPO: ${{ github.repository }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
           path: release/
           merge-multiple: true
+      # The notes' Highlights are written by Claude; best effort, a failure leaves the plain list.
+      - uses: actions/setup-python@v5
+        continue-on-error: true
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install 'anthropic==1.14.0'
+        continue-on-error: true
       - name: Upload to v${{ needs.plan.outputs.version }} with one merged SHA256SUMS
         run: |
           set -euo pipefail
           ls -la release
           # What changed since the previous release: its commit subjects, grouped by the source's
-          # own scripts/release_notes.py. Best effort - a failure here never blocks the release.
+          # own scripts/release_notes.py, with Claude's Highlights on top. Best effort - a failure
+          # here never blocks the release.
           changes=""
           if [ -n "$PREV_SHA" ] && GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/contents/scripts/release_notes.py?ref=$SHA" --jq .content | base64 -d > "$RUNNER_TEMP/release_notes.py" \
             && subjects="$(GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/compare/$PREV_SHA...$SHA" --jq '[.commits[].commit.message | split("\n")[0]] | reverse | .[]')"; then
-            changes="$(printf '%s\n' "$subjects" | python3 "$RUNNER_TEMP/release_notes.py" || true)"
+            changes="$(printf '%s\n' "$subjects" | python3 "$RUNNER_TEMP/release_notes.py" --highlights || true)"
           else
             echo "::warning::no change list for $VERSION (previous source ${PREV_SHA:-unknown})"
           fi
@@ -654,18 +663,13 @@ jobs:
       SOURCE_TOKEN: ${{ secrets.ONW_SOURCE_TOKEN }}
       REPO: ${{ github.repository }}
     steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: python -m pip install 'anthropic==1.14.0'
       - name: Post what's new
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
           GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/contents/scripts/release_announce.py?ref=$SHA" \
             --jq .content | base64 -d > "$RUNNER_TEMP/release_announce.py"
           gh release view "v$VERSION" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/notes.md"
-          python "$RUNNER_TEMP/release_announce.py" --version "$VERSION" \
+          python3 "$RUNNER_TEMP/release_announce.py" --version "$VERSION" \
             --release-url "https://github.com/$REPO/releases/tag/v$VERSION" "$RUNNER_TEMP/notes.md"
