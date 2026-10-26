@@ -638,3 +638,34 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           skip-existing: true
+
+  announce:
+    name: announce on Discord
+    needs: [plan, publish]
+    if: >-
+      !cancelled() && vars.DISCORD_ANNOUNCE == 'true'
+      && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+      SOURCE_TOKEN: ${{ secrets.ONW_SOURCE_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'anthropic==1.14.0'
+      - name: Post what's new
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/contents/scripts/release_announce.py?ref=$SHA" \
+            --jq .content | base64 -d > "$RUNNER_TEMP/release_announce.py"
+          gh release view "v$VERSION" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/notes.md"
+          python "$RUNNER_TEMP/release_announce.py" --version "$VERSION" \
+            --release-url "https://github.com/$REPO/releases/tag/v$VERSION" "$RUNNER_TEMP/notes.md"
