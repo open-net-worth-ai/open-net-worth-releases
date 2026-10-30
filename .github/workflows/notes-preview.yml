@@ -43,7 +43,7 @@ jobs:
       - run: python3 -m pip install 'anthropic==1.14.0'
       - name: Rebuild the notes and the post
         env:
-          DISCORD_WEBHOOK_URL: ${{ inputs.post && secrets.DISCORD_RELEASE_WEBHOOK || '' }}
+          DISCORD_WEBHOOK_URL: ${{ inputs.post && format('{0} {1}', secrets.DISCORD_RELEASE_WEBHOOK, secrets.DISCORD_GENERAL_WEBHOOK) || '' }}
         run: |
           set -euo pipefail
           source_of() { gh release view "v$1" --repo "$REPO" --json body --jq .body | grep -oE 'Source: [0-9a-f]{40}' | cut -c9- | tail -1 || true; }

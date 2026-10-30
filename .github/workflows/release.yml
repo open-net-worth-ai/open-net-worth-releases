@@ -665,7 +665,8 @@ jobs:
     steps:
       - name: Post what's new
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK }}
+          # #announcements, plus #general while the community is small (unset = announcements only)
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK }} ${{ secrets.DISCORD_GENERAL_WEBHOOK }}
         run: |
           set -euo pipefail
           GH_TOKEN="$SOURCE_TOKEN" gh api "repos/$SOURCE_REPO/contents/scripts/release_announce.py?ref=$SHA" \
