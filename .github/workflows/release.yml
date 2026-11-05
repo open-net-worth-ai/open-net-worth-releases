@@ -17,6 +17,8 @@ name: Release desktop apps
 # the last publish step adds the wheel, the server files and a signed manifest.json naming the
 # image digest. The portal's hourly release watch rolls that to Stable. A failure there never
 # holds back the desktop release: the watch simply waits for the next release with a manifest.
+# The `image-tags` job then moves the image's `latest` and `X.Y` tags to that release
+# (image-tags.yml), so they never lead a release that isn't published with its manifest.
 #
 # With the repository variable PYPI_PUBLISH=true, the last job publishes the same wheel and sdist
 # to PyPI (trusted publisher: this workflow, environment `pypi`), so `uv tool install
@@ -625,6 +627,17 @@ jobs:
             ./*.whl ./*.tar.gz install-server.sh docker-compose.yml \
             manifest.json manifest.json.minisig SHA256SUMS SHA256SUMS.minisig
           echo "::notice::agent image $IMAGE:$VERSION@$DIGEST; manifest.json signed and published"
+
+  image-tags:
+    name: move the image's latest and X.Y tags
+    needs: [wheel, image, publish]
+    if: >-
+      !cancelled() && needs.publish.result == 'success'
+      && needs.wheel.result == 'success' && needs.image.result == 'success'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/image-tags.yml
 
   pypi:
     name: publish to PyPI
