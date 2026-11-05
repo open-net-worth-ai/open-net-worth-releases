@@ -1,0 +1,48 @@
+name: Move image tags
+
+# Points the agent image's moving tags (`latest` and `X.Y`) at the latest published release, by
+# the image digest that release's manifest.json names. It takes no version on purpose: the tags
+# follow what GitHub calls latest, so a run can't point them at an older release by mistake. A
+# latest release with no manifest fails here, and the tags stay on the previous good release.
+#
+# release.yml calls this after a release is published. Dispatch it by hand to repair the tags.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-tags
+  cancel-in-progress: false
+
+jobs:
+  move:
+    name: move latest and X.Y to the latest release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE: ghcr.io/open-net-worth-ai/open-net-worth
+    steps:
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Move the tags
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          work="$(mktemp -d)"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern manifest.json --dir "$work"
+          version="$(jq -r .version "$work/manifest.json")"
+          digest="$(jq -r .image.digest "$work/manifest.json")"
+          [ "v$version" = "$tag" ] || { echo "::error::$tag's manifest says version $version"; exit 1; }
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version $version"; exit 1; }
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest $digest"; exit 1; }
+          minor="${version%.*}"
+          docker buildx imagetools create -t "$IMAGE:$minor" -t "$IMAGE:latest" "$IMAGE@$digest"
+          echo "::notice::$IMAGE:latest and :$minor now point at $version ($digest)"

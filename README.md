@@ -37,7 +37,10 @@ curl -fsSLO https://github.com/open-net-worth-ai/open-net-worth-releases/release
 AUTH_PASSWORD='pick a password' docker compose up -d
 ```
 
-Runs `ghcr.io/open-net-worth-ai/open-net-worth`, pinned to the release the file came with.
+Runs `ghcr.io/open-net-worth-ai/open-net-worth`, pinned to the release the file came with. The
+image also has `latest` and `X.Y` tags (such as `0.1`) that move to each new release. An update
+can't be undone without restoring a backup, so only let something update these tags automatically
+if you're happy to take every release.
 
 ## Verifying a release
 
