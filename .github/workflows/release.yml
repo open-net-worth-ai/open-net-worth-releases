@@ -687,3 +687,37 @@ jobs:
           gh release view "v$VERSION" --repo "$REPO" --json body --jq .body > "$RUNNER_TEMP/notes.md"
           python3 "$RUNNER_TEMP/release_announce.py" --version "$VERSION" \
             --release-url "https://github.com/$REPO/releases/tag/v$VERSION" "$RUNNER_TEMP/notes.md"
+
+  # Tell the maintainer when any part of a release fails or is cancelled. A release can publish
+  # with a job missing (0.1.57 shipped with no image when PyPI timed out mid-build) and nothing
+  # said so. Posts to a PRIVATE channel's webhook; unset = no alert.
+  alert:
+    name: alert on failure
+    needs: [plan, macos, linux, windows, wheel, image, publish, image-tags, pypi, announce]
+    if: >-
+      always()
+      && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to the alerts channel
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_ALERTS_WEBHOOK }}
+          NEEDS: ${{ toJSON(needs) }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WEBHOOK" ]; then echo "DISCORD_ALERTS_WEBHOOK unset; no alert"; exit 0; fi
+          python3 - <<'PY' > "$RUNNER_TEMP/alert.json"
+          import json, os
+          needs = json.loads(os.environ["NEEDS"])
+          bad = [f"{job} ({info['result']})" for job, info in needs.items()
+                 if info.get("result") in ("failure", "cancelled")]
+          version = os.environ.get("VERSION") or "unknown version"
+          text = (f"Release {version} ({os.environ['TRIGGER']}) did not finish cleanly.\n"
+                  f"Failed: {', '.join(bad)}\n{os.environ['RUN_URL']}")
+          print(json.dumps({"content": text, "allowed_mentions": {"parse": []}}))
+          PY
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            --data @"$RUNNER_TEMP/alert.json" "$WEBHOOK"
